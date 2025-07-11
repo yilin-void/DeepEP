@@ -1,3 +1,4 @@
+import os
 import random
 import torch
 import torch.distributed as dist
@@ -164,8 +165,10 @@ def test_loop(local_rank: int, num_local_ranks: int):
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
+    allow_nvlink_for_low_latency_mode = (os.environ.get(
+            "DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE", "0") == "0")
     buffer = deep_ep.Buffer(group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True,
-                            num_qps_per_rank=num_experts // num_ranks)
+                            num_qps_per_rank=num_experts // num_ranks, allow_nvlink_for_low_latency_mode=allow_nvlink_for_low_latency_mode)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
     do_pressure_test = False
