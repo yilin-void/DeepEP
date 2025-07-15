@@ -572,6 +572,25 @@ class Buffer:
                              cumulative_local_expert_recv_stats)
         return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
+    
+    # noinspection PyTypeChecker
+    def low_latency_dispatch_fp4(self, x: torch.Tensor, x_scales: torch.Tensor, topk_idx: torch.Tensor, 
+                             num_max_dispatch_tokens_per_rank: int, num_experts: int,
+                             cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                             async_finish: bool = False, return_recv_hook: bool = False) -> \
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple, EventOverlap, Callable]:
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+            self.runtime.low_latency_dispatch_fp4(x, x_scales, topk_idx,
+                                              cumulative_local_expert_recv_stats,
+                                              num_max_dispatch_tokens_per_rank, num_experts,
+                                              async_finish, return_recv_hook)
+        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+        tensors_to_record = (x, topk_idx,
+                             packed_recv_x, packed_recv_x_scales, packed_recv_count,
+                             packed_recv_src_info, packed_recv_layout_range,
+                             cumulative_local_expert_recv_stats)
+        return packed_recv_x, packed_recv_x_scales, packed_recv_count, handle, \
+            EventOverlap(event, tensors_to_record if async_finish else None), hook
 
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
