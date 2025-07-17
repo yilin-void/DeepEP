@@ -334,14 +334,14 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode,
           int kNumDispatchRDMASenderWarps, int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
 __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
-dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, SourceMeta* recv_src_meta,
-         const int4* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
+dispatch(int4* recv_x, float* recv_x_scales, int* recv_topk_idx, float* recv_topk_weights, SourceMeta* recv_src_meta,
+         const int4* x, const float* x_scales, const int* topk_idx, const float* topk_weights,
          int* send_rdma_head, int* send_nvl_head,
          int* recv_rdma_channel_prefix_matrix, int* recv_gbl_channel_prefix_matrix,
          const int* rdma_channel_prefix_matrix, const int* recv_rdma_rank_prefix_sum,
          const int* gbl_channel_prefix_matrix, const int* recv_gbl_rank_prefix_sum,
          const bool* is_token_in_rank,
-         int num_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts,
+         int num_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts, int global_expert_id_offset,
          int scale_token_stride, int scale_hidden_stride,
          void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
          void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
@@ -943,7 +943,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (lane_id < num_topk) {
                     auto recv_idx = recv_token_idx * num_topk + lane_id;
                     auto buffer_idx = token_idx_in_buffer * num_topk + lane_id;
-                    st_na_global(recv_topk_idx + recv_idx, static_cast<int64_t>(ld_nc_global(nvl_channel_topk_idx.buffer() + buffer_idx)));
+                    int local_recv_topk_idx = static_cast<int>(ld_nc_global(nvl_channel_topk_idx.buffer() + buffer_idx));
+                    local_recv_topk_idx = local_recv_topk_idx == -1 ? num_experts : local_recv_topk_idx + global_expert_id_offset;
+                    st_na_global(recv_topk_idx + recv_idx, local_recv_topk_idx);
                     st_na_global(recv_topk_weights + recv_idx, ld_nc_global(nvl_channel_topk_weights.buffer() + buffer_idx));
                 }
             }
@@ -956,14 +958,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     }
 }
 
-void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, void* recv_src_meta,
-              const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
+void dispatch(void* recv_x, float* recv_x_scales, int* recv_topk_idx, float* recv_topk_weights, void* recv_src_meta,
+              const void* x, const float* x_scales, const int* topk_idx, const float* topk_weights,
               int* send_rdma_head, int* send_nvl_head,
               int* recv_rdma_channel_prefix_matrix, int* recv_gbl_channel_prefix_matrix,
               const int* rdma_channel_prefix_matrix, const int* recv_rdma_rank_prefix_sum,
               const int* gbl_channel_prefix_matrix, const int* recv_gbl_rank_prefix_sum,
               const bool* is_token_in_rank,
-              int num_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts,
+              int num_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts, int global_expert_id_offset,
               int scale_token_stride, int scale_hidden_stride,
               void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
               void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
@@ -986,7 +988,7 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
                   rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                   gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                   is_token_in_rank, \
-                  num_tokens, hidden_int4, num_scales, num_topk, num_experts, \
+                  num_tokens, hidden_int4, num_scales, num_topk, num_experts, global_expert_id_offset, \
                   scale_token_stride, scale_hidden_stride, \
                   rdma_buffer_ptr, num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens, \
                   buffer_ptrs, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, \

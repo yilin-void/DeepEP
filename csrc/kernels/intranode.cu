@@ -165,10 +165,10 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
 
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1)
-dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
-         int* send_head, const int4* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
+dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
+         int* send_head, const int4* x, const float* x_scales, const int* topk_idx, const float* topk_weights,
          const bool* is_token_in_rank, const int* channel_prefix_matrix,
-         int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
+         int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int global_expert_id_offset, int num_scales,
          int scale_token_stride, int scale_hidden_stride,
          void** buffer_ptrs, int rank,
          int num_max_send_tokens, int num_recv_buffer_tokens) {
@@ -213,12 +213,12 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
     // Channel data buffers, stored on the receiver side
     // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
     // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
-    // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(int64_t)
+    // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(int)
     // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
     // `x_scales_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_scales * sizeof(float)
     auto channel_x_buffers = Buffer<int4>(ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
     auto channel_src_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
-    auto channel_topk_idx_buffers = Buffer<int64_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+    auto channel_topk_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
     auto channel_topk_weights_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
     auto channel_x_scales_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
@@ -427,7 +427,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 auto recv_idx = static_cast<int64_t>(total_offset + chunk_idx) * num_topk + token_topk_idx;
                 auto buffer_idx = token_idx_in_buffer * num_topk + token_topk_idx;
-                recv_topk_idx[recv_idx] = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
+                int local_recv_topk_idx = static_cast<int>(ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx));
+                local_recv_topk_idx = local_recv_topk_idx == -1 ? num_experts : local_recv_topk_idx + global_expert_id_offset;
+                st_na_global(recv_topk_idx + recv_idx, local_recv_topk_idx);
                 recv_topk_weights[recv_idx] = ld_nc_global(channel_topk_weights_buffers.buffer() + buffer_idx);
             }
 
@@ -459,7 +461,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
     }
 
 
-    // Clean unused `recv_topk_idx` as -1
+    // Clean unused `recv_topk_idx` as num_experts
     if (num_worst_tokens > 0) {
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
@@ -468,14 +470,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
         const auto clean_stride = num_sms * kNumThreads;
         #pragma unroll
         for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
-            recv_topk_idx[i] = -1;
+            recv_topk_idx[i] = num_experts;
     }
 }
 
-void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
-              int* send_head, const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
+void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
+              int* send_head, const void* x, const float* x_scales, const int* topk_idx, const float* topk_weights,
               const bool* is_token_in_rank, const int* channel_prefix_matrix,
-              int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
+              int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int global_expert_id_offset, int num_scales,
               int scale_token_stride, int scale_hidden_stride,
               void** buffer_ptrs, int rank, int num_ranks,
               cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
@@ -495,7 +497,7 @@ void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* re
         reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
         send_head, reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights, \
         is_token_in_rank, channel_prefix_matrix, \
-        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, \
+        num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, global_expert_id_offset, num_scales, \
         scale_token_stride, scale_hidden_stride, \
         buffer_ptrs, rank, \
         num_max_send_tokens, num_recv_buffer_tokens); \

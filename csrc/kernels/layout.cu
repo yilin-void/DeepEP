@@ -8,7 +8,7 @@ namespace layout {
 
 template <int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
 __global__ void __launch_bounds__(kNumThreads, 1)
-get_dispatch_layout(const int64_t* topk_idx,
+get_dispatch_layout(const int* topk_idx,
                     int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
                     int* num_tokens_per_expert, bool* is_token_in_rank,
                     int num_tokens, int num_topk, int num_ranks, int num_experts) {
@@ -116,7 +116,7 @@ get_dispatch_layout(const int64_t* topk_idx,
     }
 }
 
-void get_dispatch_layout(const int64_t* topk_idx,
+void get_dispatch_layout(const int* topk_idx,
                          int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
                          int* num_tokens_per_expert, bool* is_token_in_rank,
                          int num_tokens, int num_topk, int num_ranks, int num_experts,

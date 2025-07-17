@@ -254,7 +254,7 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
     if (is_internode_available())
         num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
-    layout::get_dispatch_layout(topk_idx.data_ptr<int64_t>(),
+    layout::get_dispatch_layout(topk_idx.data_ptr<int>(),
                                 num_tokens_per_rank.data_ptr<int>(),
                                 num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
                                 num_tokens_per_expert.data_ptr<int>(),
@@ -290,7 +290,7 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
                            const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
-                           const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
+                           const std::optional<torch::Tensor>& num_tokens_per_rank, const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert, int global_expert_id_offset,
                            int cached_num_recv_tokens, const std::optional<torch::Tensor>& cached_rank_prefix_matrix, const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
                            int expert_alignment, int num_worst_tokens, const Config& config,
                            std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
@@ -340,7 +340,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Top-k checks
     int num_topk = 0;
-    int64_t* topk_idx_ptr = nullptr;
+    int* topk_idx_ptr = nullptr;
     float* topk_weights_ptr = nullptr;
     EP_HOST_ASSERT(topk_idx.has_value() == topk_weights.has_value());
     if (topk_idx.has_value()) {
@@ -351,7 +351,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         EP_HOST_ASSERT(num_tokens == topk_idx->size(0) and num_tokens == topk_weights->size(0));
         EP_HOST_ASSERT(num_topk == topk_weights->size(1));
         EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
-        topk_idx_ptr = topk_idx->data_ptr<int64_t>();
+        topk_idx_ptr = topk_idx->data_ptr<int>();
         topk_weights_ptr = topk_weights->data_ptr<float>();
     }
 
@@ -461,13 +461,13 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     auto send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
     // Assign pointers
-    int64_t* recv_topk_idx_ptr = nullptr;
+    int* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
     float* recv_x_scales_ptr = nullptr;
     if (topk_idx.has_value()) {
         recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
-        recv_topk_idx_ptr = recv_topk_idx->data_ptr<int64_t>();
+        recv_topk_idx_ptr = recv_topk_idx->data_ptr<int>();
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
     if (x_scales.has_value()) {
@@ -484,7 +484,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                    num_channels * num_ranks * sizeof(int) * 2 +                                                             // Queue head and tail
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * recv_x.element_size() +     // Data buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                        // Source index buffer
-                   num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(int64_t) +         // Top-k index buffer
+                   num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(int) +             // Top-k index buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +           // Top-k weight buffer
                    num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales           // FP8 scale buffer
                    <= num_nvl_bytes);
@@ -493,7 +493,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         x.data_ptr(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
                         is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(),
                         num_tokens, num_worst_tokens, static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)),
-                        num_topk, num_experts, num_scales,
+                        num_topk, num_experts, global_expert_id_offset, num_scales,
                         scale_token_stride, scale_hidden_stride,
                         buffer_ptrs_gpu, rank, num_ranks, comm_stream, config.num_sms,
                         config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens);
@@ -639,7 +639,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Ten
 Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
                            const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
                            const std::optional<torch::Tensor>& num_tokens_per_rank, const std::optional<torch::Tensor>& num_tokens_per_rdma_rank,
-                           const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
+                           const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert, int global_expert_id_offset,
                            int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
                            const std::optional<torch::Tensor>& cached_rdma_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
                            const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
@@ -705,7 +705,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Top-k checks
     int num_topk = 0;
-    int64_t* topk_idx_ptr = nullptr;
+    int* topk_idx_ptr = nullptr;
     float* topk_weights_ptr = nullptr;
     EP_HOST_ASSERT(topk_idx.has_value() == topk_weights.has_value());
     if (topk_idx.has_value()) {
@@ -716,7 +716,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
         EP_HOST_ASSERT(num_tokens == topk_idx->size(0) and num_tokens == topk_weights->size(0));
         EP_HOST_ASSERT(num_topk == topk_weights->size(1));
         EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
-        topk_idx_ptr = topk_idx->data_ptr<int64_t>();
+        topk_idx_ptr = topk_idx->data_ptr<int>();
         topk_weights_ptr = topk_weights->data_ptr<float>();
     }
 
@@ -841,13 +841,13 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
     }
 
     // Assign pointers
-    int64_t* recv_topk_idx_ptr = nullptr;
+    int* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
     float* recv_x_scales_ptr = nullptr;
     if (topk_idx.has_value()) {
         recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
-        recv_topk_idx_ptr = recv_topk_idx->data_ptr<int64_t>();
+        recv_topk_idx_ptr = recv_topk_idx->data_ptr<int>();
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
     if (x_scales.has_value()) {
@@ -868,7 +868,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         rdma_channel_prefix_matrix.data_ptr<int>(), recv_rdma_rank_prefix_sum.data_ptr<int>(),
                         gbl_channel_prefix_matrix.data_ptr<int>(), recv_gbl_rank_prefix_sum.data_ptr<int>(),
                         is_token_in_rank.data_ptr<bool>(),
-                        num_tokens, hidden_int4, num_scales, num_topk, num_experts,
+                        num_tokens, hidden_int4, num_scales, num_topk, num_experts, global_expert_id_offset,
                         scale_token_stride, scale_hidden_stride,
                         rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
@@ -1087,7 +1087,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     if (cumulative_local_expert_recv_stats.has_value()) {
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
@@ -1149,7 +1149,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
-                               x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                               x.data_ptr(), topk_idx.data_ptr<int>(),
                                next_clean_meta.first, next_clean_meta.second,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
@@ -1198,7 +1198,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
-    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
     EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
@@ -1242,7 +1242,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
-                              x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
+                              x.data_ptr(), topk_idx.data_ptr<int>(), topk_weights.data_ptr<float>(),
                               src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
                               next_clean_meta.first, next_clean_meta.second,
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
