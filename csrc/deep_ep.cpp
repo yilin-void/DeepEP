@@ -9,6 +9,7 @@
 #include "deep_ep.hpp"
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+#include "kernels/extension_api.cuh"
 
 namespace deep_ep {
 
@@ -1182,6 +1183,102 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_scales, const torch::Tensor& topk_idx,
+                    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                    int num_max_dispatch_tokens_per_rank, int num_experts,
+                    bool async, bool return_recv_hook) {
+#ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(low_latency_mode);
+
+    // Tensor checks
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kByte);
+    EP_HOST_ASSERT(x_scales.dim() == 2 and x_scales.is_contiguous() and x_scales.scalar_type() == torch::kByte);
+    EP_HOST_ASSERT(x.size(1) % 16 == 0);
+    EP_HOST_ASSERT(x_scales.size(1) % 16 == 0);
+    EP_HOST_ASSERT(x.size(0) == x_scales.size(0));
+    EP_HOST_ASSERT(x.size(1) / 8 == x_scales.size(1));
+    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->dim() == 1 and cumulative_local_expert_recv_stats->is_contiguous());
+        EP_HOST_ASSERT(cumulative_local_expert_recv_stats->size(0) == num_experts / num_ranks);
+    }
+
+    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1)) * 2;
+    auto num_scales = static_cast<int>(x_scales.size(1)), num_topk = static_cast<int>(topk_idx.size(1));
+    auto num_local_experts = num_experts / num_ranks;
+
+    // Buffer control
+    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+    auto buffer = layout.buffers[low_latency_buffer_idx];
+    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+
+    // Wait previous tasks to be finished
+    // NOTES: the hook mode will always use the default stream
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    EP_HOST_ASSERT(not (async and return_recv_hook));
+    if (not return_recv_hook)
+        stream_wait(launch_stream, compute_stream);
+
+    // Allocate packed tensors
+    auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden / 2},
+                                        x.options().dtype(torch::kByte));
+    auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+    auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
+    // Allocate column-majored scales
+    auto packed_recv_x_scales = torch::empty({num_local_experts,  num_ranks * num_max_dispatch_tokens_per_rank, num_scales},
+                                        torch::dtype(torch::kByte).device(torch::kCUDA));
+    EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
+
+    // Kernel launch
+    auto next_clean_meta = next_buffer.clean_meta();
+    auto launcher = [=](int phases) {
+        extensions::dispatch_fp4(packed_recv_x.data_ptr(), packed_recv_x_scales.data_ptr(),
+                                packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
+                                packed_recv_count.data_ptr<int>(),
+                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
+                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
+                                buffer.dispatch_rdma_send_buffer,
+                                x.data_ptr(), x_scales.data_ptr(), topk_idx.data_ptr<int>(),
+                                next_clean_meta.first, next_clean_meta.second,
+                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                                num_topk, num_experts, rank, num_ranks,
+                                workspace, num_device_sms,
+                                launch_stream, phases);
+    };
+    launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async) {
+        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
+        // so in Python API, we must wrap all tensors into the event handle.
+        event = EventHandle(launch_stream);
+    } else if (not return_recv_hook) {
+        stream_wait(compute_stream, launch_stream);
+    }
+
+    // Receiver callback
+    std::optional<std::function<void()>> recv_hook = std::nullopt;
+    if (return_recv_hook)
+        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+
+    // Return values
+    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
+#else
+    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+    return {};
+#endif
+}
+
 std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                             const torch::Tensor& src_info, const torch::Tensor& layout_range,
@@ -1340,6 +1437,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
+        .def("low_latency_dispatch_fp4", &deep_ep::Buffer::low_latency_dispatch_fp4)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
