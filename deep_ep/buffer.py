@@ -584,7 +584,7 @@ class Buffer:
                                               cumulative_local_expert_recv_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               async_finish, return_recv_hook)
-        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1) * 2, num_experts)
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
                              packed_recv_src_info, packed_recv_layout_range,
