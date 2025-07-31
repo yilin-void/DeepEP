@@ -142,18 +142,26 @@ public:
                          int num_max_dispatch_tokens_per_rank, int num_experts,
                          bool use_fp8, bool round_scale, bool use_ue8m0,
                          bool async, bool return_recv_hook);
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-    low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_scales, const torch::Tensor& topk_idx,
-                        const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-                        int num_max_dispatch_tokens_per_rank, int num_experts,
-                        bool async, bool return_recv_hook);
-
+                         
     std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
     low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                         const torch::Tensor& src_info, const torch::Tensor& layout_range,
                         int num_max_dispatch_tokens_per_rank, int num_experts,
                         bool zero_copy, bool async, bool return_recv_hook,
                         const std::optional<torch::Tensor>& out = std::nullopt);
+
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+    low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_scales, const torch::Tensor& topk_idx,
+                        const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                        int num_max_dispatch_tokens_per_rank, int num_experts,
+                        bool async, bool return_recv_hook);
+    std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+    low_latency_combine_fp4(const torch::Tensor& x, const torch::Tensor& global_scale,
+                                const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+                                const torch::Tensor& src_info, const torch::Tensor& layout_range,
+                                int num_max_dispatch_tokens_per_rank, int num_experts,
+                                bool async, bool return_recv_hook,
+                                const std::optional<torch::Tensor>& out);
 
     torch::Tensor
     get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const;

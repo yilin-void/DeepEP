@@ -1183,6 +1183,99 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 #endif
 }
 
+std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+                            const torch::Tensor& src_info, const torch::Tensor& layout_range,
+                            int num_max_dispatch_tokens_per_rank, int num_experts,
+                            bool zero_copy, bool async, bool return_recv_hook,
+                            const std::optional<torch::Tensor>& out) {
+#ifndef DISABLE_NVSHMEM
+    EP_HOST_ASSERT(low_latency_mode);
+
+    // Tensor checks
+    EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
+    EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
+    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
+    EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
+    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
+    EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
+    EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and x.size(0) == src_info.size(0));
+    EP_HOST_ASSERT(layout_range.dim() == 2 and layout_range.is_contiguous());
+    EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and layout_range.size(1) == num_ranks);
+    auto hidden = static_cast<int>(x.size(2));
+    auto num_topk = static_cast<int>(topk_weights.size(1));
+    auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
+
+    // Buffer control
+    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
+    auto buffer = layout.buffers[low_latency_buffer_idx];
+    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+
+    // Wait previous tasks to be finished
+    // NOTES: the hook mode will always use the default stream
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    EP_HOST_ASSERT(not (async and return_recv_hook));
+    if (not return_recv_hook)
+        stream_wait(launch_stream, compute_stream);
+
+    // Allocate output tensor
+    torch::Tensor combined_x;
+    if (out.has_value()) {
+        EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
+        EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
+        EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
+        combined_x = out.value();
+    } else {
+        combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+    }
+
+    // Kernel launch
+    auto next_clean_meta = next_buffer.clean_meta();
+    auto launcher = [=](int phases) {
+        internode_ll::combine(combined_x.data_ptr(),
+                              buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
+                              buffer.combine_rdma_send_buffer,
+                              x.data_ptr(), topk_idx.data_ptr<int>(), topk_weights.data_ptr<float>(),
+                              src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
+                              next_clean_meta.first, next_clean_meta.second,
+                              num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+                              num_topk, num_experts, rank, num_ranks,
+                              workspace, num_device_sms,
+                              launch_stream, phases, zero_copy);
+    };
+    launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async) {
+        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
+        // so in Python API, we must wrap all tensors into the event handle.
+        event = EventHandle(launch_stream);
+    } else if (not return_recv_hook) {
+        stream_wait(compute_stream, launch_stream);
+    }
+
+    // Receiver callback
+    std::optional<std::function<void()>> recv_hook = std::nullopt;
+    if (return_recv_hook)
+        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+
+    // Return values
+    return {combined_x, event, recv_hook};
+#else
+    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+    return {};
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_scales, const torch::Tensor& topk_idx,
                     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
@@ -1280,10 +1373,11 @@ Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_
 }
 
 std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+Buffer::low_latency_combine_fp4(const torch::Tensor& x, const torch::Tensor& global_scale,
+                            const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                             const torch::Tensor& src_info, const torch::Tensor& layout_range,
                             int num_max_dispatch_tokens_per_rank, int num_experts,
-                            bool zero_copy, bool async, bool return_recv_hook,
+                            bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
@@ -1293,6 +1387,10 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
     EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
+    EP_HOST_ASSERT(global_scale.dim() == x.dim());
+    EP_HOST_ASSERT(global_scale.is_contiguous());
+    EP_HOST_ASSERT(global_scale.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(global_scale.size(0) == x.size(0) and global_scale.size(1) == x.size(1) and global_scale.size(2) == 1);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
@@ -1327,25 +1425,27 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     if (out.has_value()) {
         EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
         EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
-        EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
+        EP_HOST_ASSERT(out->scalar_type() == torch::kBFloat16);
         combined_x = out.value();
     } else {
-        combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        combined_x = torch::empty({num_combined_tokens, hidden}, x.options().dtype(torch::kBFloat16));
     }
 
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
-        internode_ll::combine(combined_x.data_ptr(),
+        extensions::combine_fp4(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
-                              x.data_ptr(), topk_idx.data_ptr<int>(), topk_weights.data_ptr<float>(),
+                              x.data_ptr(), global_scale.data_ptr<float>(),
+                              topk_idx.data_ptr<int>(), topk_weights.data_ptr<float>(),
                               src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
                               next_clean_meta.first, next_clean_meta.second,
-                              num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                              num_topk, num_experts, rank, num_ranks,
+                              num_combined_tokens, hidden, num_topk,
+                              num_max_dispatch_tokens_per_rank, 
+                              num_experts, rank, num_ranks,
                               workspace, num_device_sms,
-                              launch_stream, phases, zero_copy);
+                              launch_stream, phases);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1400,6 +1500,70 @@ bool is_sm90_compiled() {
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor> quantize_bf16_to_nvfp4(const torch::Tensor& x, const torch::Tensor& global_scale) {
+    EP_HOST_ASSERT(x.dim() == 2 or x.dim() == 3);
+    EP_HOST_ASSERT(x.is_contiguous());
+    EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+    EP_HOST_ASSERT(global_scale.dim() == x.dim());
+    EP_HOST_ASSERT(global_scale.is_contiguous());
+    EP_HOST_ASSERT(global_scale.scalar_type() == torch::kFloat32);
+
+    int hidden_size, token_num;
+    torch::Tensor x_packed_nvfp4, x_scales;
+    if(x.dim() == 2) {
+        EP_HOST_ASSERT(global_scale.size(0) == x.size(0) and global_scale.size(1) == 1);
+        hidden_size = static_cast<int>(x.size(1));
+        token_num = static_cast<int>(x.size(0));
+        x_packed_nvfp4 = torch::empty({token_num, hidden_size / 2}, torch::dtype(torch::kByte).device(torch::kCUDA));
+        x_scales = torch::empty({token_num, hidden_size / 16}, torch::dtype(torch::kByte).device(torch::kCUDA));
+    } else {
+        EP_HOST_ASSERT(global_scale.size(0) == x.size(0) and global_scale.size(1) == x.size(1) and global_scale.size(2) == 1);
+        hidden_size = static_cast<int>(x.size(2));
+        token_num = static_cast<int>(x.size(0) * x.size(1));
+        x_packed_nvfp4 = torch::empty({x.size(0), x.size(1), hidden_size / 2}, torch::dtype(torch::kByte).device(torch::kCUDA));
+        x_scales = torch::empty({x.size(0), x.size(1), hidden_size / 16}, torch::dtype(torch::kByte).device(torch::kCUDA));
+    }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    extensions::quantize_bf16_to_nvfp4(x.data_ptr(), global_scale.data_ptr<float>(),
+                                       x_packed_nvfp4.data_ptr(), x_scales.data_ptr(),
+                                       token_num, hidden_size, stream);
+    return {x_packed_nvfp4, x_scales};
+}
+
+torch::Tensor dequantize_nvfp4_to_bf16(const torch::Tensor& packed_nvfp4_x, const torch::Tensor& global_scale, const torch::Tensor& fp8_scales) {
+    EP_HOST_ASSERT(packed_nvfp4_x.dim() == 2 or packed_nvfp4_x.dim() == 3);
+    EP_HOST_ASSERT(packed_nvfp4_x.is_contiguous());
+    EP_HOST_ASSERT(packed_nvfp4_x.scalar_type() == torch::kByte);
+    EP_HOST_ASSERT(fp8_scales.dim() == packed_nvfp4_x.dim());
+    EP_HOST_ASSERT(fp8_scales.is_contiguous());
+    EP_HOST_ASSERT(fp8_scales.scalar_type() == torch::kByte);
+    EP_HOST_ASSERT(global_scale.dim() == packed_nvfp4_x.dim());
+    EP_HOST_ASSERT(global_scale.is_contiguous());
+    EP_HOST_ASSERT(global_scale.scalar_type() == torch::kFloat32);
+
+    int hidden_size, token_num;
+    torch::Tensor x;
+    if(packed_nvfp4_x.dim() == 2) {
+        EP_HOST_ASSERT(global_scale.size(0) == packed_nvfp4_x.size(0) and global_scale.size(1) == 1);
+        EP_HOST_ASSERT(packed_nvfp4_x.size(1) / 8 == fp8_scales.size(1));
+        hidden_size = static_cast<int>(packed_nvfp4_x.size(1)) * 2;
+        token_num = static_cast<int>(packed_nvfp4_x.size(0));
+        x = torch::empty({token_num, hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
+    } else {
+        EP_HOST_ASSERT(global_scale.size(0) == packed_nvfp4_x.size(0) and global_scale.size(1) == packed_nvfp4_x.size(1) and global_scale.size(2) == 1);
+        EP_HOST_ASSERT(packed_nvfp4_x.size(2) / 8 == fp8_scales.size(2));
+        hidden_size = static_cast<int>(packed_nvfp4_x.size(2)) * 2;
+        token_num = static_cast<int>(packed_nvfp4_x.size(0) * packed_nvfp4_x.size(1));
+        x = torch::empty({packed_nvfp4_x.size(0), packed_nvfp4_x.size(1), hidden_size}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    extensions::dequantize_nvfp4_to_bf16(packed_nvfp4_x.data_ptr(), global_scale.data_ptr<float>(),
+                                         fp8_scales.data_ptr(), x.data_ptr(),
+                                         token_num, hidden_size, stream);
+    return x;
+}
+
 } // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1437,9 +1601,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
-        .def("low_latency_dispatch_fp4", &deep_ep::Buffer::low_latency_dispatch_fp4)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
+        .def("low_latency_dispatch_fp4", &deep_ep::Buffer::low_latency_dispatch_fp4)
+        .def("low_latency_combine_fp4", &deep_ep::Buffer::low_latency_combine_fp4)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
+    m.def("quantize_bf16_to_nvfp4", deep_ep::quantize_bf16_to_nvfp4);
+    m.def("dequantize_nvfp4_to_bf16", deep_ep::dequantize_nvfp4_to_bf16);
 }
