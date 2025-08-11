@@ -156,27 +156,17 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     
     verify_dispatch_fp4(packed_recv_x, packed_recv_scales, real_recv_count, tokens_packed_fp4, scales_fp8, topk_idx, num_tokens, num_experts, num_ranks, rank, hidden)
 
-    x = torch.empty((num_local_experts, num_tokens * num_ranks, hidden), dtype=torch.bfloat16, device='cuda')
-    x_global_scales = torch.empty((num_local_experts, num_tokens * num_ranks, 1), dtype=torch.float32, device='cuda')
-    for i in range(num_local_experts):
-        global_expert_idx = rank * num_local_experts + i
-        expert_mask = (topk_idx == global_expert_idx)
-        expert_positions = torch.nonzero(expert_mask, as_tuple=True)
-        if expert_positions[0].numel() > 0:
-            rank_indices = expert_positions[0]
-            token_indices = expert_positions[1]
-            x[i, :len(rank_indices)] = tokens_bf16[rank_indices, token_indices]
-            x_global_scales[i, :len(rank_indices)] = global_scales[rank_indices, token_indices]
+    x, recv_count, handle, event, hook = buffer.low_latency_dispatch(tokens_bf16[rank], topk_idx[rank], num_tokens, num_experts, use_fp8=False)
+    assert torch.equal(recv_count, real_recv_count)
     
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    x_global_scales = (448 * 6) / x.abs().max(dim=-1, keepdim=True).values.to(torch.float32)
     combined_x, event, hook = buffer.low_latency_combine_fp4(x, x_global_scales, topk_idx[rank], topk_weights, handle)
-
     tokens_bf16_reconstructed = deep_ep.Buffer.dequantize_nvfp4_to_bf16(tokens_packed_fp4[rank], global_scales[rank], scales_fp8[rank])
     combined_x_ref = tokens_bf16_reconstructed * num_topk
-    if not torch.allclose(combined_x, combined_x_ref, atol=1e-4):
-        if rank == 0:
-            print(f'Combined x: {combined_x}')
-            print(f'Combined x ref: {combined_x_ref}')
+    
+    assert torch.allclose(combined_x, combined_x_ref, atol=1e-4)
+    print(f"[rank {rank}] LL Combine FP4 accuracy verify pass")
     
     def test_func():
         recv_x, recv_scales, recv_count, handle, event, hook = \

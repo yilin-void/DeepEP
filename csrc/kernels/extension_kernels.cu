@@ -253,9 +253,9 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
         const auto num_threads = (num_warps - 1) * 32;
 
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
-            const auto x_int4 = static_cast<const int4*>(x) + token_idx * kHiddenVecAccessNum;
-            const auto x_scales_int4  = static_cast<const int4*>(x_scales) + token_idx * kScalesVecAccessNum;
-            const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * kNumBytesPerMsg);
+            const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * kHiddenVecAccessNum;
+            const auto x_scales_int4  = reinterpret_cast<const int4*>(x_scales) + token_idx * kScalesVecAccessNum;
+            const auto rdma_x_src_idx = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(rdma_x) + token_idx * kNumBytesPerMsg);
             const auto rdma_x_vec = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
             const auto rdma_x_scales = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + kHiddenBytes);
 
@@ -384,14 +384,14 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
-        const auto rdma_recv_x_uint8 = static_cast<uint8_t*>(rdma_recv_x) +
+        const auto rdma_recv_x_uint8 = reinterpret_cast<uint8_t*>(rdma_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kNumBytesPerMsg +
                 src_rank * num_max_dispatch_tokens_per_rank * kNumBytesPerMsg;
-        const auto recv_x_int4 = static_cast<int4*>(packed_recv_x) +
+        const auto recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kHiddenVecAccessNum;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
-        const auto recv_scales_int4  = static_cast<int4*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kScalesVecAccessNum;
+        const auto recv_scales_int4  = reinterpret_cast<int4*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kScalesVecAccessNum;
 
         // Shared between sub-warps in warp groups
         __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups], shared_recv_token_begin_idx[kNumMaxWarpGroups];
@@ -459,7 +459,7 @@ void dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
     EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
 
     // Workspace checks
-    auto atomic_counter_per_expert = static_cast<int*>(workspace);
+    auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
@@ -512,7 +512,7 @@ combine_fp4(void* combined_x,
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
     // Data type staffs
-    constexpr size_t kHiddenBf16VecAccessNum = kHidden * sizeof(nv_bfloat16) / sizeof(int4);
+    constexpr size_t kHiddenBf16VecAccessNum = kHidden / kBF16ElemsNumPerVecAccess;
     constexpr size_t kHiddenFp4Bytes = kHidden / 2;
     constexpr size_t kScalesBytes = kHidden / 16;
     constexpr size_t kGlobalScaleBytes = sizeof(float);
@@ -541,10 +541,10 @@ combine_fp4(void* combined_x,
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
         const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
         const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
-        const auto local_x = static_cast<const int4*>(x) +
+        const auto local_x = reinterpret_cast<const int4*>(x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kHiddenBf16VecAccessNum;
         const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
-        auto rdma_send_x_current_expert = static_cast<uint8_t*>(rdma_send_x) +
+        auto rdma_send_x_current_expert = reinterpret_cast<uint8_t*>(rdma_send_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kNumBytesPerSlot;             
 
         // Unpack layout
@@ -556,10 +556,10 @@ combine_fp4(void* combined_x,
             auto rdma_send_x_vec = reinterpret_cast<uint32_t*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot);
             auto rdma_send_x_scales_vec = reinterpret_cast<uint8_t*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenFp4Bytes);
             auto rdma_send_x_global_scale_vec = reinterpret_cast<float*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenFp4Bytes + kScalesBytes);
-            auto global_scale_val = __ldg(global_scale_per_token + token_idx);
+            auto global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
             rdma_send_x_global_scale_vec[0] = global_scale_val;
             const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
-            for(int i = thread_id; i < kHiddenBf16VecAccessNum; i += num_threads) {
+            for(int i = lane_id; i < kHiddenBf16VecAccessNum; i += 32) {
                 auto int4_value = __ldg(x_int4 + i);
                 auto bf16x2_vals = reinterpret_cast<__nv_bfloat162*>(&int4_value);
                 auto local_max = __habs2(bf16x2_vals[0]);
@@ -631,7 +631,6 @@ combine_fp4(void* combined_x,
         }
     }
     cg::this_grid().sync();
-    auto const hidden_store_int4 = kHidden / kBF16ElemsNumPerVecAccess;
     for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
         // Read top-k indices and weights
         int reg_topk_idx[kNumMaxTopk];
@@ -641,12 +640,12 @@ combine_fp4(void* combined_x,
             reg_topk_idx[i] = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + i));
             reg_topk_weights[i] = __ldg(topk_weights + token_idx * num_topk + i);
         }
-        for(auto vec_id = thread_id; vec_id < hidden_store_int4; vec_id += num_threads) {
+        for(auto vec_id = thread_id; vec_id < kHiddenBf16VecAccessNum; vec_id += num_threads) {
             float combined_values[kBF16ElemsNumPerVecAccess] = {0.f};
             #pragma unroll
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
                 // Read from sources
-                auto rdma_x_buffer = static_cast<uint8_t*>(rdma_recv_x) + 
+                auto rdma_x_buffer = reinterpret_cast<uint8_t*>(rdma_recv_x) + 
                         (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot;
                 auto rdma_x_scales_buffer = rdma_x_buffer + kHiddenFp4Bytes;
                 auto rdma_global_scale_ptr = reinterpret_cast<float*>(rdma_x_scales_buffer + kScalesBytes);
@@ -656,8 +655,8 @@ combine_fp4(void* combined_x,
                     global_scale_val = 1.f;
                 }
                 // Dequantize and reduce
-                auto x_vec = ld_nc_global(reinterpret_cast<const uint32_t*>(rdma_x_buffer) + thread_id);
-                auto x_scale = ld_nc_global(rdma_x_scales_buffer + thread_id / 2);
+                auto x_vec = ld_nc_global(reinterpret_cast<const uint32_t*>(rdma_x_buffer) + vec_id);
+                auto x_scale = ld_nc_global(rdma_x_scales_buffer + vec_id / 2);
                 __nv_fp8_e4m3 x_scale_fp8;
                 x_scale_fp8.__x = x_scale;
                 float x_scale_fp32 = static_cast<float>(x_scale_fp8);
@@ -666,7 +665,7 @@ combine_fp4(void* combined_x,
                 e2m1_to_fp32_vec(x_vec, x_fp32);
                 #pragma unroll
                 for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j) {
-                    combined_values[j] += x_fp32[j] * reg_topk_weights[i];
+                    combined_values[j] += x_fp32[j] * x_scale_fp32 * reg_topk_weights[i];
                 }
             }
 
@@ -676,7 +675,7 @@ combine_fp4(void* combined_x,
             #pragma unroll
             for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j)
                 combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
-            (static_cast<int4*>(combined_x) + token_idx * hidden_store_int4)[vec_id] = combined_int4;
+            (reinterpret_cast<int4*>(combined_x) + token_idx * kHiddenBf16VecAccessNum)[vec_id] = combined_int4;
         }
     }
 }
@@ -701,7 +700,7 @@ void combine_fp4(void* combined_x,
     const auto num_sms = ceil_div(num_experts, num_warp_groups);
 
     // Check workspace
-    auto atomic_clean_flag = static_cast<int*>(workspace);
+    auto atomic_clean_flag = reinterpret_cast<int*>(workspace);
     EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
