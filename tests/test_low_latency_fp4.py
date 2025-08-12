@@ -7,74 +7,6 @@ from functools import partial
 import deep_ep
 from utils import init_dist, bench_kineto, hash_tensor
 
-def print_tensor_comparison(original_tensor, reconstructed_tensor, abs_diff_tensor, 
-                           threshold=0.1, num_elements=128, tensor_name="Tensor"):
-    orig_sample = original_tensor.flatten()[:num_elements].tolist()
-    recon_sample = reconstructed_tensor.flatten()[:num_elements].tolist()
-    diff_sample = abs_diff_tensor.flatten()[:num_elements].tolist()
-    
-    print(f'{tensor_name} comparison (first {num_elements} elements):')
-    print(f'{"Index":<6} {"Original":<12} {"Reconstructed":<12} {"Abs Diff":<12}')
-    print('-' * 50)
-    
-    for i in range(num_elements):
-        orig_val = orig_sample[i]
-        recon_val = recon_sample[i]
-        diff_val = diff_sample[i]
-
-        if diff_val > threshold:
-            colored_diff = f"\033[91m{diff_val:.6f}\033[0m"
-        else:
-            colored_diff = f"\033[92m{diff_val:.6f}\033[0m"
-        
-        print(f'{i:<6} {orig_val:<12.6f} {recon_val:<12.6f} {colored_diff}')
-
-def check_quantization_accuracy(shape, tensor_name):
-    x_bf16 = torch.randn(shape, dtype=torch.bfloat16, device='cuda')
-    global_scale = (448 * 6) / x_bf16.abs().max(dim=-1, keepdim=True).values.to(torch.float32)
-    
-    packed_nvfp4, fp8_scales = deep_ep.Buffer.quantize_bf16_to_nvfp4(x_bf16, global_scale)
-    x_bf16_reconstructed = deep_ep.Buffer.dequantize_nvfp4_to_bf16(packed_nvfp4, global_scale, fp8_scales)
-    
-    x_bf16_float = x_bf16.float()
-    x_reconstructed_float = x_bf16_reconstructed.float()
-    
-    abs_diff = torch.abs(x_bf16_float - x_reconstructed_float)
-    max_abs_error = 0.1
-    max_abs_diff = abs_diff.max().item()
-    
-    print(f'{tensor_name} quantization error analysis:')
-    print(f'  Max absolute error: {max_abs_diff:.6f} (threshold: {max_abs_error})')
-
-    pass_all = True
-    
-    if max_abs_diff >= max_abs_error:
-        print(f'ERROR: {tensor_name} max absolute error {max_abs_diff:.6f} exceeds threshold {max_abs_error}')
-        print(f'Original tensor stats: min={x_bf16_float.min().item():.6f}, max={x_bf16_float.max().item():.6f}, mean={x_bf16_float.mean().item():.6f}')
-        print(f'Reconstructed tensor stats: min={x_reconstructed_float.min().item():.6f}, max={x_reconstructed_float.max().item():.6f}, mean={x_reconstructed_float.mean().item():.6f}')
-        print(f'Absolute difference stats: min={abs_diff.min().item():.6f}, max={abs_diff.max().item():.6f}, mean={abs_diff.mean().item():.6f}')
-        print_tensor_comparison(x_bf16_float, x_reconstructed_float, abs_diff, 
-                               threshold=max_abs_error, num_elements=128, tensor_name=tensor_name)
-        print(f'{tensor_name} max absolute error {max_abs_diff:.6f} exceeds threshold {max_abs_error}')
-        pass_all = False
-    if pass_all:
-        print(f'{tensor_name} NVFP4 quantization accuracy verify pass')
-    else:
-        print(f'{tensor_name} NVFP4 quantization accuracy verify failed')
-    return pass_all
-
-def test_nvfp4_quantization(num_tokens: int, hidden: int):
-    print(f'Testing NVFP4 quantization with small tensor (1, 128)...')
-    check_pass = check_quantization_accuracy((1, 128), "Small tensor (1, 128)")
-    if not check_pass:
-        return False
-    print(f'Testing NVFP4 quantization with large tensor ({num_tokens}, {hidden})...')
-    check_pass = check_quantization_accuracy((num_tokens, hidden), f"Large tensor ({num_tokens}, {hidden})")
-    if not check_pass:
-        return False
-    print(f'All NVFP4 quantization tests passed!', flush=True)
-    return True
-
 def verify_dispatch_fp4(packed_recv_x: torch.Tensor, packed_recv_scales: torch.Tensor, real_recv_count: torch.Tensor,
                         tokens: torch.Tensor, scales: torch.Tensor, topk_idx: torch.Tensor, num_tokens: int,
                         num_experts: int, num_ranks: int, rank: int, hidden: int):
@@ -215,6 +147,5 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == '__main__':
     # TODO: you may modify NUMA binding for less CPU overhead
-    # test_nvfp4_quantization(128, 7168)
     num_processes = 8
     torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
