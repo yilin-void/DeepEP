@@ -159,14 +159,19 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     x, recv_count, handle, event, hook = buffer.low_latency_dispatch(tokens_bf16[rank], topk_idx[rank], num_tokens, num_experts, use_fp8=False)
     assert torch.equal(recv_count, real_recv_count)
     
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    topk_weights = torch.softmax(topk_weights, dim=1)
     x_global_scales = (448 * 6) / x.abs().max(dim=-1, keepdim=True).values.to(torch.float32)
     combined_x, event, hook = buffer.low_latency_combine_fp4(x, x_global_scales, topk_idx[rank], topk_weights, handle)
     tokens_bf16_reconstructed = deep_ep.Buffer.dequantize_nvfp4_to_bf16(tokens_packed_fp4[rank], global_scales[rank], scales_fp8[rank])
-    combined_x_ref = tokens_bf16_reconstructed * num_topk
-    
-    assert torch.allclose(combined_x, combined_x_ref, atol=1e-4)
-    print(f"[rank {rank}] LL Combine FP4 accuracy verify pass")
+    combined_x_ref = torch.zeros_like(tokens_bf16_reconstructed).to(torch.float32)
+    for i in range(num_tokens):
+        for j in range(num_topk):
+            if topk_idx[rank][i, j] >= 0:
+                combined_x_ref[i] += tokens_bf16_reconstructed[i].to(torch.float32) * topk_weights[i, j]
+    combined_x_ref = combined_x_ref.to(torch.bfloat16)
+    assert torch.allclose(combined_x, combined_x_ref, atol=1e-1)
+    print(f'[rank {rank}] LL Combine FP4 accuracy verify pass', flush=True)
     
     def test_func():
         recv_x, recv_scales, recv_count, handle, event, hook = \

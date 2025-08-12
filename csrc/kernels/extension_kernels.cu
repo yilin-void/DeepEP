@@ -104,39 +104,64 @@ int get_sm_count() {
     return num_device_sms;
 }
 
+__device__ std::tuple<uint32_t, uint8_t> quantize_bf16_to_nvfp4(const int4& packed_input_bf16, const float gloabl_scale) {
+    const auto bf16x2_vals = reinterpret_cast<const __nv_bfloat162*>(&packed_input_bf16);
+    auto local_max = __habs2(bf16x2_vals[0]);
+    for(int j = 1; j < 4; ++j) {
+        local_max = __hmax2(local_max, __habs2(bf16x2_vals[j]));
+    }
+    local_max = __hmax2(local_max, __shfl_xor_sync(~0, local_max, 1));
+    float max_val = static_cast<float>(__hmax(local_max.x, local_max.y));
+    float scale_val = gloabl_scale * (max_val * reciprocal_approximate_ftz(6.0f));
+    float scale_val_narrow;
+    uint8_t scale_val_fp8;
+    __nv_fp8_e4m3 tmp = static_cast<__nv_fp8_e4m3>(scale_val);
+    scale_val_narrow = static_cast<float>(tmp);
+    scale_val_fp8 = tmp.__x;
+    float output_scale = scale_val != 0 ? reciprocal_approximate_ftz(scale_val_narrow * reciprocal_approximate_ftz(gloabl_scale)) : 0.f;
+    float input_vec_fp32[8];
+    for(int j = 0; j < 8; ++j) {
+        input_vec_fp32[j] = static_cast<float>(reinterpret_cast<const nv_bfloat16*>(&packed_input_bf16)[j]) * output_scale;
+    }
+    uint32_t e2m1_vec = fp32_vec_to_e2m1(input_vec_fp32);
+    return {e2m1_vec, scale_val_fp8};
+}
+
+template <bool ApplyWeight>
+__device__ void dequantize_nvfp4_to_bf16(const uint32_t& packed_input_nvfp4, const float global_scale, const uint8_t scale_val_fp8, float (&output_fp32)[8], const float weight = 1.f) {
+    float global_scale_reciprocal = 1.f / global_scale;
+    if(__isinf(global_scale_reciprocal)) {
+        global_scale_reciprocal = 1.f;
+    }
+    __nv_fp8_e4m3 tmp;
+    tmp.__x = scale_val_fp8;
+    float scale_val_fp32 = static_cast<float>(tmp);
+    scale_val_fp32 *= global_scale_reciprocal;
+    e2m1_to_fp32_vec(packed_input_nvfp4, output_fp32);
+    #pragma unroll
+    for (int j = 0; j < 8; ++ j) {
+        if constexpr(ApplyWeight) {
+            output_fp32[j] = output_fp32[j] * scale_val_fp32 * weight;
+        } else {
+            output_fp32[j] = output_fp32[j] * scale_val_fp32;
+        }
+    }
+}
+
 __global__ __launch_bounds__(1024) void quantize_bf16_to_nvfp4_kernel(const void* input, const float* global_scale_per_token, 
                                                         void* nvfp4_packed_output, void* fp8_scales, 
                                                         int token_num, int hidden_access_num) {
-    constexpr int kElemNumPerAccess = sizeof(int4) / sizeof(nv_bfloat16);
     for(int token_idx = blockIdx.x; token_idx < token_num; token_idx += gridDim.x) {
         float global_scale_val = __ldg(global_scale_per_token + token_idx);
         for(int access_idx = threadIdx.x; access_idx < hidden_access_num; access_idx += blockDim.x) {
             const auto input_buffer = reinterpret_cast<const int4*>(input) + token_idx * hidden_access_num + access_idx;
             auto packed_output_buffer = reinterpret_cast<uint32_t*>(nvfp4_packed_output) + token_idx * hidden_access_num + access_idx;
             auto scales_buffer = reinterpret_cast<uint8_t*>(fp8_scales) + token_idx * hidden_access_num / 2 + access_idx / 2;
-            auto input_vec = __ldg(input_buffer);
-            auto max_abs_val = __habs(*reinterpret_cast<nv_bfloat16*>(&input_vec));
-            for(int i = 1; i < kElemNumPerAccess; ++i) {
-                max_abs_val = __hmax(max_abs_val, __habs(reinterpret_cast<nv_bfloat16*>(&input_vec)[i]));
-            }
-            max_abs_val = __hmax(max_abs_val, __shfl_xor_sync(~0, max_abs_val, 1));
-            float vec_max = static_cast<float>(max_abs_val);
-            float scale_val = global_scale_val * (vec_max * reciprocal_approximate_ftz(6.0f));
-            float scale_val_narrow;
-            uint8_t fp8_scale_val;
-            __nv_fp8_e4m3 tmp = static_cast<__nv_fp8_e4m3>(scale_val);
-            fp8_scale_val = tmp.__x;
-            scale_val_narrow = static_cast<float>(tmp);
-            float output_scale = scale_val != 0 ? reciprocal_approximate_ftz(scale_val_narrow * reciprocal_approximate_ftz(global_scale_val)) : 0.f;
+            auto [e2m1_vec, fp8_scale_val] = quantize_bf16_to_nvfp4(__ldg(input_buffer), global_scale_val);
+            packed_output_buffer[0] = e2m1_vec;
             if(threadIdx.x % 2 == 0) {
                 scales_buffer[0] = fp8_scale_val;
             }
-            float input_vec_fp32[kElemNumPerAccess];
-            for(int i = 0; i < kElemNumPerAccess; ++i) {
-                input_vec_fp32[i] = static_cast<float>(reinterpret_cast<nv_bfloat16*>(&input_vec)[i]) * output_scale;
-            }
-            uint32_t e2m1_vec = fp32_vec_to_e2m1(input_vec_fp32);
-            packed_output_buffer[0] = e2m1_vec;
         }
     }
 }
@@ -160,25 +185,18 @@ __global__ __launch_bounds__(1024) void dequantize_nvfp4_to_bf16_kernel(const vo
                                                             int token_num, int hidden_access_num) {
     constexpr int kElemNumPerAccess = sizeof(int4) / sizeof(nv_bfloat16);
     for(int token_idx = blockIdx.x; token_idx < token_num; token_idx += gridDim.x) {
-        float global_scale_val = 1.f / __ldg(global_scale_per_token + token_idx);
-        if(__isinf(global_scale_val)) {
-            global_scale_val = 1.f;
-        }
+        float global_scale_val = __ldg(global_scale_per_token + token_idx);
         for(int access_idx = threadIdx.x; access_idx < hidden_access_num; access_idx += blockDim.x) {
             const auto packed_input_buffer = reinterpret_cast<const uint32_t*>(nvfp4_packed_input) + token_idx * hidden_access_num + access_idx;
             const auto scales_buffer = reinterpret_cast<const uint8_t*>(fp8_scales) + token_idx * hidden_access_num / 2 + access_idx / 2;
             auto output_buffer = reinterpret_cast<int4*>(output) + token_idx * hidden_access_num + access_idx;
             auto e2m1_vec = __ldg(packed_input_buffer);
-            float input_vec_fp32[kElemNumPerAccess];
-            e2m1_to_fp32_vec(e2m1_vec, input_vec_fp32);
             auto scale_val = __ldg(scales_buffer);
-            float scale_val_fp32;
-            __nv_fp8_e4m3 tmp;
-            tmp.__x = scale_val;
-            scale_val_fp32 = static_cast<float>(tmp) * global_scale_val;
+            float output_fp32[kElemNumPerAccess];
+            dequantize_nvfp4_to_bf16<false>(e2m1_vec, global_scale_val, scale_val, output_fp32);
             int4 output_vec;
             for(int i = 0; i < kElemNumPerAccess; ++i) {
-                reinterpret_cast<nv_bfloat16*>(&output_vec)[i] = static_cast<nv_bfloat16>(input_vec_fp32[i] * scale_val_fp32);
+                reinterpret_cast<nv_bfloat16*>(&output_vec)[i] = static_cast<nv_bfloat16>(output_fp32[i]);
             }
             *output_buffer = output_vec;
         }
@@ -561,25 +579,7 @@ combine_fp4(void* combined_x,
             const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
             for(int i = lane_id; i < kHiddenBf16VecAccessNum; i += 32) {
                 auto int4_value = __ldg(x_int4 + i);
-                auto bf16x2_vals = reinterpret_cast<__nv_bfloat162*>(&int4_value);
-                auto local_max = __habs2(bf16x2_vals[0]);
-                for(int j = 1; j < kBF16ElemsNumPerVecAccess / 2; ++j) {
-                    local_max = __hmax2(local_max, __habs2(bf16x2_vals[j]));
-                }
-                local_max = __hmax2(local_max, __shfl_xor_sync(~0, local_max, 1));
-                float max_val = static_cast<float>(__hmax(local_max.x, local_max.y));
-                float scale_val = global_scale_val * (max_val * reciprocal_approximate_ftz(6.0f));
-                float scale_val_narrow;
-                uint8_t fp8_scale_val;
-                __nv_fp8_e4m3 tmp = static_cast<__nv_fp8_e4m3>(scale_val);
-                scale_val_narrow = static_cast<float>(tmp);
-                fp8_scale_val = tmp.__x;
-                float output_scale = scale_val != 0 ? reciprocal_approximate_ftz(scale_val_narrow * reciprocal_approximate_ftz(global_scale_val)) : 0.f;
-                float input_vec_fp32[kBF16ElemsNumPerVecAccess];
-                for(int j = 0; j < kBF16ElemsNumPerVecAccess; ++j) {
-                    input_vec_fp32[j] = static_cast<float>(reinterpret_cast<nv_bfloat16*>(&int4_value)[j]) * output_scale;
-                }
-                uint32_t e2m1_vec = fp32_vec_to_e2m1(input_vec_fp32);
+                auto [e2m1_vec, fp8_scale_val] = quantize_bf16_to_nvfp4(int4_value, global_scale_val);
                 rdma_send_x_vec[i] = e2m1_vec;
                 if(i % 2 == 0) {
                     rdma_send_x_scales_vec[i / 2] = fp8_scale_val;
@@ -632,7 +632,6 @@ combine_fp4(void* combined_x,
     }
     cg::this_grid().sync();
     for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
-        // Read top-k indices and weights
         int reg_topk_idx[kNumMaxTopk];
         float reg_topk_weights[kNumMaxTopk];
         #pragma unroll
@@ -644,38 +643,27 @@ combine_fp4(void* combined_x,
             float combined_values[kBF16ElemsNumPerVecAccess] = {0.f};
             #pragma unroll
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
-                // Read from sources
                 auto rdma_x_buffer = reinterpret_cast<uint8_t*>(rdma_recv_x) + 
                         (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot;
                 auto rdma_x_scales_buffer = rdma_x_buffer + kHiddenFp4Bytes;
                 auto rdma_global_scale_ptr = reinterpret_cast<float*>(rdma_x_scales_buffer + kScalesBytes);
 
-                auto global_scale_val = 1.f / __ldg(rdma_global_scale_ptr);
-                if(__isinf(global_scale_val)) {
-                    global_scale_val = 1.f;
-                }
-                // Dequantize and reduce
+                auto global_scale_val = __ldg(rdma_global_scale_ptr);
                 auto x_vec = ld_nc_global(reinterpret_cast<const uint32_t*>(rdma_x_buffer) + vec_id);
                 auto x_scale = ld_nc_global(rdma_x_scales_buffer + vec_id / 2);
-                __nv_fp8_e4m3 x_scale_fp8;
-                x_scale_fp8.__x = x_scale;
-                float x_scale_fp32 = static_cast<float>(x_scale_fp8);
-                x_scale_fp32 *= global_scale_val;
                 float x_fp32[kBF16ElemsNumPerVecAccess];
-                e2m1_to_fp32_vec(x_vec, x_fp32);
+                dequantize_nvfp4_to_bf16<true>(x_vec, global_scale_val, x_scale, x_fp32, reg_topk_weights[i]);
                 #pragma unroll
                 for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j) {
-                    combined_values[j] += x_fp32[j] * x_scale_fp32 * reg_topk_weights[i];
+                    combined_values[j] += x_fp32[j];
                 }
             }
-
-            // Write results
-            int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
-            auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
+            
+            int4 combined_vec_bf16;
             #pragma unroll
             for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j)
-                combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
-            (reinterpret_cast<int4*>(combined_x) + token_idx * kHiddenBf16VecAccessNum)[vec_id] = combined_int4;
+                reinterpret_cast<nv_bfloat16*>(&combined_vec_bf16)[j] = static_cast<nv_bfloat16>(combined_values[j]);
+            (reinterpret_cast<int4*>(combined_x) + token_idx * kHiddenBf16VecAccessNum)[vec_id] = combined_vec_bf16;
         }
     }
 }
