@@ -15,6 +15,30 @@ inline __device__ float reciprocal_approximate_ftz(float a)
     return b;
 }
 
+inline __device__ uint32_t float_to_e2m1(float val) {
+    bool sign = val < 0;
+    float abs_val = abs(val);
+    uint32_t e2m1_val = 0;
+    if(abs_val < 0.25f) {
+        e2m1_val = 0;
+    } else if(abs_val <= 0.75f) {
+        e2m1_val = 1;
+    } else if(abs_val <= 1.25f) {
+        e2m1_val = 2;
+    } else if(abs_val <= 1.75f) {
+        e2m1_val = 3;
+    } else if(abs_val <= 2.5f) {
+        e2m1_val = 4;
+    } else if(abs_val <= 3.5f) {
+        e2m1_val = 5;
+    } else if(abs_val <= 5.f) {
+        e2m1_val = 6;
+    } else {
+        e2m1_val = 7;
+    }
+    return sign ? e2m1_val | 8 : e2m1_val;
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8])
 {
@@ -37,8 +61,11 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8])
         "f"(array[7]));
     return val;
 #else
-    EP_DEVICE_ASSERT(false);
-    return 0;
+    uint32_t val = 0;
+    for(int i = 0; i < 8; i++) {
+        val |= float_to_e2m1(array[i]) << (i * 4);
+    }
+    return val;
 #endif
 }
 
