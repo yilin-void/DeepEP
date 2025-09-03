@@ -19,17 +19,17 @@ inline __device__ uint32_t float_to_e2m1(float val) {
     bool sign = val < 0;
     float abs_val = abs(val);
     uint32_t e2m1_val = 0;
-    if(abs_val < 0.25f) {
+    if(abs_val <= 0.25f) {
         e2m1_val = 0;
-    } else if(abs_val <= 0.75f) {
+    } else if(abs_val < 0.75f) {
         e2m1_val = 1;
     } else if(abs_val <= 1.25f) {
         e2m1_val = 2;
-    } else if(abs_val <= 1.75f) {
+    } else if(abs_val < 1.75f) {
         e2m1_val = 3;
     } else if(abs_val <= 2.5f) {
         e2m1_val = 4;
-    } else if(abs_val <= 3.5f) {
+    } else if(abs_val < 3.5f) {
         e2m1_val = 5;
     } else if(abs_val <= 5.f) {
         e2m1_val = 6;
