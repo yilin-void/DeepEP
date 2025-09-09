@@ -220,6 +220,7 @@ void dequantize_nvfp4_to_bf16(const void* nvfp4_packed_input, const float* globa
 #define SWITCH_HIDDEN_FP4(case_macro) \
 switch (hidden) { \
     case 4096: case_macro(4096); \
+    case 6144: case_macro(6144); \
     case 7168: case_macro(7168); \
     default: EP_HOST_ASSERT(false && "Unsupported hidden"); \
 } while (false)
