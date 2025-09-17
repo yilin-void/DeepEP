@@ -21,9 +21,9 @@ namespace extensions {
         int num_topk, int num_experts, int rank, int num_ranks,
         void* workspace, int num_device_sms,
         cudaStream_t stream, int phases);
-    void combine_fp4(void* combined_x,
+    void low_precision_combine(int precision, void* combined_x,
         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
-        const void* x, const float* global_scale,
+        const void* x, const float* global_scale_per_token,
         const int* topk_idx, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
         int* next_clean, int num_next_clean_int,

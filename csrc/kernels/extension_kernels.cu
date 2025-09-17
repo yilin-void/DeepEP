@@ -217,7 +217,43 @@ void dequantize_nvfp4_to_bf16(const void* nvfp4_packed_input, const float* globa
                     fp8_scales, output, token_num, hidden_access_num);
 }
 
-#define SWITCH_HIDDEN_FP4(case_macro) \
+__device__ std::tuple<int2, float> quantize_bf16_to_fp8(const int4& packed_input_bf16) {
+    constexpr int kNumElemsPerRead = 8;
+    auto bf16_values = reinterpret_cast<const nv_bfloat16*>(&packed_input_bf16);
+    float fp32_values[kNumElemsPerRead];
+    float amax = kFP8Margin, scale, scale_inv;
+    #pragma unroll
+    for (int j = 0; j < kNumElemsPerRead; ++ j) {
+        fp32_values[j] = static_cast<float>(bf16_values[j]);
+        amax = fmaxf(amax, fabsf(fp32_values[j]));
+    }
+    amax = half_warp_reduce_max(amax);
+    calculate_fp8_scales(amax, scale, scale_inv, false);
+    int2 int2_value;
+    auto fp8_values = reinterpret_cast<__nv_fp8_e4m3*>(&int2_value);
+    #pragma unroll
+    for (int j = 0; j < kNumElemsPerRead; ++j) {
+        fp8_values[j] = static_cast<__nv_fp8_e4m3>(fp32_values[j] * scale);
+    }
+    return {int2_value, scale_inv};
+}
+
+template <bool ApplyWeight>
+__device__ void dequantize_fp8_to_bf16(const int2& packed_input_fp8, const float scale_val, float (&output_fp32)[8], const float weight = 1.f) {
+    constexpr int kNumElemsPerRead = 8;
+    auto scale = extract_required_scale_format<false>(scale_val);
+    auto fp8_values = reinterpret_cast<const __nv_fp8_e4m3*>(&packed_input_fp8);
+    #pragma unroll
+    for (int j = 0; j < kNumElemsPerRead; ++j) {
+        if constexpr(ApplyWeight) {
+            output_fp32[j] = static_cast<float>(fp8_values[j]) * scale * weight;
+        } else {
+            output_fp32[j] = static_cast<float>(fp8_values[j]) * scale;
+        }
+    }
+}
+
+#define SWITCH_HIDDEN_FOR_EXTENSION_KERNELS(case_macro) \
 switch (hidden) { \
     case 4096: case_macro(4096); \
     case 6144: case_macro(6144); \
@@ -499,13 +535,55 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
                 phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-    SWITCH_HIDDEN_FP4(DISPATCH_LAUNCH_CASE);
+    SWITCH_HIDDEN_FOR_EXTENSION_KERNELS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
-template <int kHidden, int kNumMaxTopk>
+enum class LowPrecisionType : int {
+    FP8 = 0,
+    NVFP4 = 1
+};
+
+template <LowPrecisionType kPrecision>
+struct LowPrecisionTypeTraits {};
+template <>
+struct LowPrecisionTypeTraits<LowPrecisionType::NVFP4> {
+    using ScaleType = uint8_t;
+    using CommVecType = uint32_t;
+    static constexpr int kNumElemsPerUnit = 2;
+    static constexpr int kUnitBytes = 1;
+    static constexpr int kNumElemsPerScale = 16;
+    static constexpr int kBytesPerScale = sizeof(ScaleType);
+    static constexpr bool kUseGlobalScale = true;
+
+    __device__ static std::tuple<CommVecType, ScaleType> quantize(const int4& int4_value, const float global_scale_val) {
+        return quantize_bf16_to_nvfp4(int4_value, global_scale_val);
+    }
+    __device__ static void dequantize(const CommVecType& comm_vec, const float global_scale_val, const ScaleType scale_vec, float (&output_fp32)[8], const float weight = 1.f) {
+        dequantize_nvfp4_to_bf16<true>(comm_vec, global_scale_val, scale_vec, output_fp32, weight);
+    }
+};
+template <>
+struct LowPrecisionTypeTraits<LowPrecisionType::FP8> {
+    using ScaleType = float;
+    using CommVecType = int2;
+    static constexpr int kNumElemsPerUnit = 1;
+    static constexpr int kUnitBytes = 1;
+    static constexpr int kNumElemsPerScale = 128;
+    static constexpr int kBytesPerScale = sizeof(ScaleType);
+    static constexpr bool kUseGlobalScale = false;
+    __device__ static std::tuple<CommVecType, ScaleType> quantize(const int4& int4_value, const float global_scale_val) {
+        return quantize_bf16_to_fp8(int4_value);
+    }
+    __device__ static void dequantize(const CommVecType& comm_vec, const float global_scale_val, const ScaleType scale_vec, float (&output_fp32)[8], const float weight = 1.f) {
+        dequantize_fp8_to_bf16<true>(comm_vec, scale_vec, output_fp32, weight);
+    }
+};
+
+
+template <LowPrecisionType kPrecision, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(1024, 1) void
-combine_fp4(void* combined_x,
+low_precision_combine(void* combined_x,
         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
         const void* x, const float* global_scale_per_token,
         const int* topk_idx, const float* topk_weights,
@@ -517,8 +595,11 @@ combine_fp4(void* combined_x,
         int num_experts, int rank, int num_ranks,
         int num_warp_groups, int num_warps_per_group,
         int phases) {
+    using CommVecType = typename LowPrecisionTypeTraits<kPrecision>::CommVecType;
+    using ScaleType = typename LowPrecisionTypeTraits<kPrecision>::ScaleType;
     EP_DEVICE_ASSERT(num_topk <= 32);
     constexpr int kBF16ElemsNumPerVecAccess = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kThreadsPerScale = LowPrecisionTypeTraits<kPrecision>::kNumElemsPerScale / kBF16ElemsNumPerVecAccess;
     EP_STATIC_ASSERT(kHidden % (32 * kBF16ElemsNumPerVecAccess) == 0, "Invalid vectorization");
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -532,12 +613,12 @@ combine_fp4(void* combined_x,
 
     // Data type staffs
     constexpr size_t kHiddenBf16VecAccessNum = kHidden / kBF16ElemsNumPerVecAccess;
-    constexpr size_t kHiddenFp4Bytes = kHidden / 2;
-    constexpr size_t kScalesBytes = kHidden / 16;
-    constexpr size_t kGlobalScaleBytes = sizeof(float);
+    constexpr size_t kHiddenCommBytes = kHidden / LowPrecisionTypeTraits<kPrecision>::kNumElemsPerUnit * LowPrecisionTypeTraits<kPrecision>::kUnitBytes;
+    constexpr size_t kScalesBytes = kHidden / LowPrecisionTypeTraits<kPrecision>::kNumElemsPerScale * LowPrecisionTypeTraits<kPrecision>::kBytesPerScale;
+    constexpr size_t kGlobalScaleBytes = LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale ? sizeof(float) : 0;
 
     // Message package
-    constexpr size_t kNumBytesPerSlot = (kHiddenFp4Bytes + kScalesBytes + kGlobalScaleBytes + sizeof(int4) - 1) / sizeof(int4) * sizeof(int4);
+    constexpr size_t kNumBytesPerSlot = (kHiddenCommBytes + kScalesBytes + kGlobalScaleBytes + sizeof(int4) - 1) / sizeof(int4) * sizeof(int4);
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -572,18 +653,21 @@ combine_fp4(void* combined_x,
 
         // Issue IBGDA send
         for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += num_warps_per_group) {
-            auto rdma_send_x_vec = reinterpret_cast<uint32_t*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot);
-            auto rdma_send_x_scales_vec = reinterpret_cast<uint8_t*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenFp4Bytes);
-            auto rdma_send_x_global_scale_vec = reinterpret_cast<float*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenFp4Bytes + kScalesBytes);
-            auto global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
-            rdma_send_x_global_scale_vec[0] = global_scale_val;
+            auto rdma_send_x_vec = reinterpret_cast<CommVecType*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot);
+            auto rdma_send_x_scales_vec = reinterpret_cast<ScaleType*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenCommBytes);
+            float global_scale_val = 0.f;
+            if constexpr (LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale) {
+                auto rdma_send_x_global_scale_vec = reinterpret_cast<float*>(rdma_send_x_current_expert + token_idx * kNumBytesPerSlot + kHiddenCommBytes + kScalesBytes);
+                global_scale_val = __ldg(global_scale_per_token + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank + token_idx);
+                rdma_send_x_global_scale_vec[0] = global_scale_val;
+            }
             const auto x_int4 = local_x + token_idx * kHiddenBf16VecAccessNum;
             for(int i = lane_id; i < kHiddenBf16VecAccessNum; i += 32) {
                 auto int4_value = __ldg(x_int4 + i);
-                auto [e2m1_vec, fp8_scale_val] = quantize_bf16_to_nvfp4(int4_value, global_scale_val);
-                rdma_send_x_vec[i] = e2m1_vec;
-                if(i % 2 == 0) {
-                    rdma_send_x_scales_vec[i / 2] = fp8_scale_val;
+                auto [comm_vec, scale_vec] = LowPrecisionTypeTraits<kPrecision>::quantize(int4_value, global_scale_val);
+                rdma_send_x_vec[i] = comm_vec;
+                if(i % kThreadsPerScale == 0) {
+                    rdma_send_x_scales_vec[i / kThreadsPerScale] = scale_vec;
                 }
             }
 
@@ -646,14 +730,17 @@ combine_fp4(void* combined_x,
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
                 auto rdma_x_buffer = reinterpret_cast<uint8_t*>(rdma_recv_x) + 
                         (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * kNumBytesPerSlot;
-                auto rdma_x_scales_buffer = rdma_x_buffer + kHiddenFp4Bytes;
-                auto rdma_global_scale_ptr = reinterpret_cast<float*>(rdma_x_scales_buffer + kScalesBytes);
-
-                auto global_scale_val = __ldg(rdma_global_scale_ptr);
-                auto x_vec = ld_nc_global(reinterpret_cast<const uint32_t*>(rdma_x_buffer) + vec_id);
-                auto x_scale = ld_nc_global(rdma_x_scales_buffer + vec_id / 2);
+                auto rdma_x_scales_buffer = rdma_x_buffer + kHiddenCommBytes;
+                
+                float global_scale_val = 0.f;
+                if constexpr (LowPrecisionTypeTraits<kPrecision>::kUseGlobalScale) {
+                    auto rdma_global_scale_ptr = reinterpret_cast<float*>(rdma_x_scales_buffer + kScalesBytes);
+                    global_scale_val = __ldg(rdma_global_scale_ptr);
+                }
+                auto x_vec = ld_nc_global(reinterpret_cast<CommVecType*>(rdma_x_buffer) + vec_id);
+                auto x_scale = ld_nc_global(reinterpret_cast<ScaleType*>(rdma_x_scales_buffer) + vec_id / kThreadsPerScale);
                 float x_fp32[kBF16ElemsNumPerVecAccess];
-                dequantize_nvfp4_to_bf16<true>(x_vec, global_scale_val, x_scale, x_fp32, reg_topk_weights[i]);
+                LowPrecisionTypeTraits<kPrecision>::dequantize(x_vec, global_scale_val, x_scale, x_fp32, reg_topk_weights[i]);
                 #pragma unroll
                 for (int j = 0; j < kBF16ElemsNumPerVecAccess; ++ j) {
                     combined_values[j] += x_fp32[j];
@@ -669,7 +756,7 @@ combine_fp4(void* combined_x,
     }
 }
 
-void combine_fp4(void* combined_x,
+void low_precision_combine(int precision,void* combined_x,
             void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
             const void* x, const float* global_scale_per_token,
             const int* topk_idx, const float* topk_weights,
@@ -680,6 +767,7 @@ void combine_fp4(void* combined_x,
             int num_experts, int rank, int num_ranks,
             void* workspace, int num_device_sms,
             cudaStream_t stream, int phases) {
+    EP_HOST_ASSERT(precision == 0 or precision == 1);
     constexpr int kNumMaxTopk = 9;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -694,7 +782,13 @@ void combine_fp4(void* combined_x,
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
 #define COMBINE_LAUNCH_CASE(hidden) { \
-auto combine_func = combine_fp4<hidden, kNumMaxTopk>; \
+auto combine_func = low_precision_combine<LowPrecisionType::FP8, hidden, kNumMaxTopk>; \
+if(precision != 0) { \
+    combine_func = low_precision_combine<LowPrecisionType::NVFP4, hidden, kNumMaxTopk>; \
+    EP_HOST_ASSERT(global_scale_per_token != nullptr); \
+} else { \
+    EP_HOST_ASSERT(global_scale_per_token == nullptr); \
+} \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, \
               rdma_recv_x, rdma_recv_flag, rdma_send_x, \
@@ -709,9 +803,9 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-    SWITCH_HIDDEN_FP4(COMBINE_LAUNCH_CASE);
+    SWITCH_HIDDEN_FOR_EXTENSION_KERNELS(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
-#undef SWITCH_HIDDEN_FP4
+#undef SWITCH_HIDDEN_FOR_EXTENSION_KERNELS
 }
 }
