@@ -94,7 +94,7 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
     topk_weights = torch.softmax(topk_weights, dim=1)
     x_global_scales = (448 * 6) / x.abs().max(dim=-1, keepdim=True).values.to(torch.float32)
-    combined_x, event, hook = buffer.low_latency_combine_fp4(x, x_global_scales, topk_idx[rank], topk_weights, handle)
+    combined_x, event, hook = buffer.low_latency_combine_low_precision(1, x, x_global_scales, topk_idx[rank], topk_weights, handle)
     tokens_bf16_reconstructed = deep_ep.Buffer.dequantize_nvfp4_to_bf16(tokens_packed_fp4[rank], global_scales[rank], scales_fp8[rank])
     combined_x_ref = torch.zeros_like(tokens_bf16_reconstructed).to(torch.float32)
     for i in range(num_tokens):
@@ -109,7 +109,7 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         recv_x, recv_scales, recv_count, handle, event, hook = \
             buffer.low_latency_dispatch_fp4(tokens_packed_fp4[rank], scales_fp8[rank], topk_idx[rank], num_tokens, num_experts)
         combined_x, event, hook = \
-            buffer.low_latency_combine_fp4(x, x_global_scales, topk_idx[rank], topk_weights, handle)
+            buffer.low_latency_combine_low_precision(1, x, x_global_scales, topk_idx[rank], topk_weights, handle)
     
     hidden_in_bytes_packed_fp4 = hidden // 2
     scales_in_bytes_fp8 = hidden // 16
@@ -120,10 +120,10 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         comm_bytes += num_bytes * num_selections
 
     group.barrier()
-    dispatch_t, combine_t = bench_kineto(partial(test_func), kernel_names=('dispatch_fp4', 'combine_fp4'), 
+    dispatch_t, combine_t = bench_kineto(partial(test_func), kernel_names=('dispatch_fp4', 'low_precision_combine'), 
                         barrier_comm_profiling=True, suppress_kineto_output=True)
     print(f'[rank {rank}] LL Dispatch FP4 bandwidth: {comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us, | '
-          f'LL Combine FP4 bandwidth: {comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+          f'LL Low Precision Combine bandwidth: {comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
     
 
 # noinspection PyUnboundLocalVariable

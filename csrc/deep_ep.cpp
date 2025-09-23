@@ -1373,7 +1373,7 @@ Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_
 }
 
 std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-Buffer::low_latency_combine_fp4(const torch::Tensor& x, const torch::Tensor& global_scale,
+Buffer::low_latency_combine_low_precision(int precision, const torch::Tensor& x, const std::optional<torch::Tensor>& global_scale,
                             const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                             const torch::Tensor& src_info, const torch::Tensor& layout_range,
                             int num_max_dispatch_tokens_per_rank, int num_experts,
@@ -1387,10 +1387,12 @@ Buffer::low_latency_combine_fp4(const torch::Tensor& x, const torch::Tensor& glo
     EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
     EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
-    EP_HOST_ASSERT(global_scale.dim() == x.dim());
-    EP_HOST_ASSERT(global_scale.is_contiguous());
-    EP_HOST_ASSERT(global_scale.scalar_type() == torch::kFloat32);
-    EP_HOST_ASSERT(global_scale.size(0) == x.size(0) and global_scale.size(1) == x.size(1) and global_scale.size(2) == 1);
+    if (global_scale.has_value()) {
+        EP_HOST_ASSERT(global_scale.value().dim() == x.dim());
+        EP_HOST_ASSERT(global_scale.value().is_contiguous());
+        EP_HOST_ASSERT(global_scale.value().scalar_type() == torch::kFloat32);
+        EP_HOST_ASSERT(global_scale.value().size(0) == x.size(0) and global_scale.value().size(1) == x.size(1) and global_scale.value().size(2) == 1);
+    }
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
@@ -1434,10 +1436,10 @@ Buffer::low_latency_combine_fp4(const torch::Tensor& x, const torch::Tensor& glo
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
-        extensions::combine_fp4(combined_x.data_ptr(),
+        extensions::low_precision_combine(precision, combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
-                              x.data_ptr(), global_scale.data_ptr<float>(),
+                              x.data_ptr(), global_scale.has_value() ? global_scale.value().data_ptr<float>() : nullptr,
                               topk_idx.data_ptr<int>(), topk_weights.data_ptr<float>(),
                               src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
                               next_clean_meta.first, next_clean_meta.second,
@@ -1603,7 +1605,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
         .def("low_latency_dispatch_fp4", &deep_ep::Buffer::low_latency_dispatch_fp4)
-        .def("low_latency_combine_fp4", &deep_ep::Buffer::low_latency_combine_fp4)
+        .def("low_latency_combine_low_precision", &deep_ep::Buffer::low_latency_combine_low_precision)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
