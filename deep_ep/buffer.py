@@ -642,17 +642,23 @@ class Buffer:
             EventOverlap(event, tensors_to_record if async_finish else None), hook
     
     # noinspection PyTypeChecker
-    def low_latency_combine_low_precision(self, precision: int, x: torch.Tensor, global_scale: torch.Tensor, 
+    def low_latency_combine_low_precision(self, precision: str, x: torch.Tensor, global_scale: torch.Tensor, 
                             topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         Arguments:
-            precision: the precision of the low-precision kernel, 0 for FP8, 1 for NVFP4.
+            precision: the precision of the low-precision kernel, only "fp8" and "nvfp4" are supported.
         """
+        precision_options = {
+            "fp8": 0,
+            "nvfp4": 1
+        }
+        assert precision in precision_options
+        precision_value = precision_options[precision]
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        combined_x, event, hook = self.runtime.low_latency_combine_low_precision(precision, x, global_scale, 
+        combined_x, event, hook = self.runtime.low_latency_combine_low_precision(precision_value, x, global_scale, 
                                                                        topk_idx, topk_weights, src_info, layout_range,
                                                                        num_max_dispatch_tokens_per_rank, num_experts,
                                                                        async_finish, return_recv_hook, out)
