@@ -131,3 +131,28 @@
             EP_HOST_ASSERT(false and "Unsupported hidden"); \
     }                                                       \
     while (false)
+
+#define SWITCH_HIDDEN_LL_DISPATCH(case_macro)               \
+    switch (hidden) {                                       \
+        case 1024:                                          \
+            case_macro(1024, 16); /* For qwen3 nvfp4*/      \
+        case 1792:                                          \
+            case_macro(1792, 16); /* For DS R1 nvfp4*/      \
+        case 2048:                                          \
+            case_macro(2048, 128);                          \
+        case 2560:                                          \
+            case_macro(2560, 128);                          \
+        case 4096:                                          \
+            case_macro(4096, 128);                          \
+        case 5120:                                          \
+            case_macro(5120, 128);                          \
+        case 6144:                                          \
+            case_macro(6144, 128); /* For qwen3 coder */    \
+        case 7168:                                          \
+            case_macro(7168, 128);                          \
+        case 8192:                                          \
+            case_macro(8192, 128);                          \
+        default:                                            \
+            EP_HOST_ASSERT(false and "Unsupported hidden"); \
+    }                                                       \
+    while (false)

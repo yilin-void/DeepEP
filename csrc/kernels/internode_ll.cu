@@ -126,7 +126,7 @@ void clean_low_latency_buffer(int* clean_0,
                   sync_buffer_ptr);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, int kHidden, bool kExternalScales = false, int kNumPerChannels = 128>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -139,6 +139,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     int* rdma_recv_count,
                                                     void* rdma_x,
                                                     const void* x,
+                                                    const void* x_scales,
                                                     const topk_idx_t* topk_idx,
                                                     int* atomic_counter_per_expert,
                                                     int* atomic_finish_counter_per_expert,
@@ -164,13 +165,15 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
+    EP_STATIC_ASSERT(!(kExternalScales && kUseFP8) && !(kExternalScales && kUseUE8M0), "External scales are not supported for FP8 dispatch");
+    EP_STATIC_ASSERT(!kUseFP8 || kNumPerChannels == 128, "When FP8 dispatch is used, kNumPerChannels must be 128");
+
     // May extract UE8M0 from the scales
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
     EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
 
     // FP8 staffs
-    constexpr int kNumPerChannels = 128;
     const int num_scales = kHidden / kNumPerChannels;
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
@@ -178,7 +181,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : 
+                                    (kHidden * sizeof(nv_bfloat16) + (kExternalScales ? num_scales * sizeof(float) : 0)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
@@ -247,6 +251,13 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 } else {
                     // Reinterpret-cast is for C++14 compatibility
                     rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
+                }
+            }
+            if constexpr (kExternalScales) {
+                const auto x_scales_float = reinterpret_cast<const float*>(x_scales) + token_idx * num_scales;
+                #pragma unroll
+                for(int i = thread_id; i < num_scales; i += num_threads) {
+                    rdma_x_scales[i] = __ldg(x_scales_float + i);
                 }
             }
             asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
@@ -422,7 +433,6 @@ LOW_LATENCY_DISPATCH_RECV:
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
         // Copy tokens
-        EP_DEVICE_ASSERT(num_scales <= 64);
         for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
@@ -438,6 +448,7 @@ LOW_LATENCY_DISPATCH_RECV:
 
             // Copy scales
             if constexpr (kUseFP8) {
+                EP_DEVICE_ASSERT(num_scales <= 64);
                 // Equivalent CuTe layout:
                 //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
@@ -457,6 +468,13 @@ LOW_LATENCY_DISPATCH_RECV:
                     auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
+            } else if constexpr (kExternalScales) {
+                const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
+                const auto token_idx = recv_token_begin_idx + i;
+                #pragma unroll
+                for(int j = lane_id; j < num_scales; j += 32) {
+                    recv_x_scales[token_idx * num_scales + j] = ld_nc_global(src_scales + j);
+                }
             }
         }
     }
@@ -474,6 +492,7 @@ void dispatch(void* packed_recv_x,
               int* rdma_recv_count,
               void* rdma_x,
               const void* x,
+              const void* x_scales,
               const topk_idx_t* topk_idx,
               int* next_clean,
               int num_next_clean_int,
@@ -507,50 +526,57 @@ void dispatch(void* packed_recv_x,
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
     // FP8 checks
-    if (use_ue8m0)
+    if (use_ue8m0) {
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
+    }
+    if (x_scales != nullptr) {
+        EP_HOST_ASSERT(!use_fp8 and !use_ue8m0 and "External scales are not supported for FP8 dispatch");
+    }
 
-#define DISPATCH_LAUNCH_CASE(hidden)                         \
-    {                                                        \
-        auto dispatch_func = dispatch<false, false, hidden>; \
-        if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, hidden>;   \
-        if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, hidden>;    \
-        LAUNCH_KERNEL(&cfg,                                  \
-                      dispatch_func,                         \
-                      packed_recv_x,                         \
-                      packed_recv_x_scales,                  \
-                      packed_recv_src_info,                  \
-                      packed_recv_layout_range,              \
-                      packed_recv_count,                     \
-                      mask_buffer_ptr,                       \
-                      cumulative_local_expert_recv_stats,    \
-                      dispatch_wait_recv_cost_stats,         \
-                      rdma_recv_x,                           \
-                      rdma_recv_count,                       \
-                      rdma_x,                                \
-                      x,                                     \
-                      topk_idx,                              \
-                      atomic_counter_per_expert,             \
-                      atomic_finish_counter_per_expert,      \
-                      next_clean,                            \
-                      num_next_clean_int,                    \
-                      num_tokens,                            \
-                      num_max_dispatch_tokens_per_rank,      \
-                      num_topk,                              \
-                      num_experts,                           \
-                      rank,                                  \
-                      num_ranks,                             \
-                      num_warp_groups,                       \
-                      num_warps_per_group,                   \
-                      round_scale,                           \
-                      phases);                               \
-    }                                                        \
+#define DISPATCH_LAUNCH_CASE(hidden, num_per_channels)                                  \
+    {                                                                                   \
+        auto dispatch_func = dispatch<false, false, hidden, false, num_per_channels>;   \
+        if (use_fp8 and not use_ue8m0)                                                  \
+            dispatch_func = dispatch<true, false, hidden, false, num_per_channels>;     \
+        if (use_fp8 and use_ue8m0)                                                      \
+            dispatch_func = dispatch<true, true, hidden, true, num_per_channels>;       \
+        if (x_scales != nullptr)                                                        \
+            dispatch_func = dispatch<false, false, hidden, true, num_per_channels>;     \
+        LAUNCH_KERNEL(&cfg,                                                             \
+                      dispatch_func,                                                    \
+                      packed_recv_x,                                                    \
+                      packed_recv_x_scales,                                             \
+                      packed_recv_src_info,                                             \
+                      packed_recv_layout_range,                                         \
+                      packed_recv_count,                                                \
+                      mask_buffer_ptr,                                                  \
+                      cumulative_local_expert_recv_stats,                               \
+                      dispatch_wait_recv_cost_stats,                                    \
+                      rdma_recv_x,                                                      \
+                      rdma_recv_count,                                                  \
+                      rdma_x,                                                           \
+                      x,                                                                \
+                      x_scales,                                                         \
+                      topk_idx,                                                         \
+                      atomic_counter_per_expert,                                        \
+                      atomic_finish_counter_per_expert,                                 \
+                      next_clean,                                                       \
+                      num_next_clean_int,                                               \
+                      num_tokens,                                                       \
+                      num_max_dispatch_tokens_per_rank,                                 \
+                      num_topk,                                                         \
+                      num_experts,                                                      \
+                      rank,                                                             \
+                      num_ranks,                                                        \
+                      num_warp_groups,                                                  \
+                      num_warps_per_group,                                              \
+                      round_scale,                                                      \
+                      phases);                                                          \
+    }                                                                                   \
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-    SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
+    SWITCH_HIDDEN_LL_DISPATCH(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
