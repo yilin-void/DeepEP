@@ -498,6 +498,7 @@ void dispatch(void* packed_recv_x,
               int num_next_clean_int,
               int num_tokens,
               int hidden,
+              int num_per_channels,
               int num_max_dispatch_tokens_per_rank,
               int num_topk,
               int num_experts,
@@ -576,7 +577,20 @@ void dispatch(void* packed_recv_x,
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-    SWITCH_HIDDEN_LL_DISPATCH(DISPATCH_LAUNCH_CASE);
+    
+#define DISPATCH_LAUNCH_CASE_WITH_HIDDEN(hidden_val)                                    \
+    switch (num_per_channels) {                                                         \
+        case 16:                                                                        \
+            DISPATCH_LAUNCH_CASE(hidden_val, 16);                                       \
+        case 128:                                                                       \
+            DISPATCH_LAUNCH_CASE(hidden_val, 128);                                      \
+        default:                                                                        \
+            EP_HOST_ASSERT(false and "Unsupported scales");                             \
+    }
+
+    SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE_WITH_HIDDEN);
+    
+#undef DISPATCH_LAUNCH_CASE_WITH_HIDDEN
 #undef DISPATCH_LAUNCH_CASE
 }
 

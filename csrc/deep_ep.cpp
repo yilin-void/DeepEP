@@ -1403,6 +1403,7 @@ std::tuple<torch::Tensor,
            std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch(const torch::Tensor& x,
                              const torch::Tensor& topk_idx,
+                             const std::optional<torch::Tensor>& x_scales,
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
                              int num_max_dispatch_tokens_per_rank,
@@ -1423,6 +1424,12 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
+    if (x_scales.has_value()) {
+        EP_HOST_ASSERT(!use_fp8 and !use_ue8m0);
+        EP_HOST_ASSERT(x_scales->dim() == 2 and x_scales->is_contiguous());
+        EP_HOST_ASSERT(x_scales->size(0) == x.size(0) and x.size(1) % x_scales->size(1) == 0);
+        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32);
+    }
 
     // Diagnosis tensors
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -1437,6 +1444,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_per_channels = x_scales.has_value() ? static_cast<int>(x.size(1) / x_scales->size(1)) : 128;
     auto num_topk = static_cast<int>(topk_idx.size(1));
     auto num_local_experts = num_experts / num_ranks;
 
@@ -1482,6 +1490,12 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
     }
 
+    if (x_scales.has_value()) {
+        packed_recv_x_scales = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden / num_per_channels},
+                                            torch::dtype(torch::kFloat32).device(torch::kCUDA));
+        packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
+    }
+
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
@@ -1498,11 +1512,13 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             buffer.dispatch_rdma_recv_count_buffer,
             buffer.dispatch_rdma_send_buffer,
             x.data_ptr(),
+            x_scales.has_value() ? x_scales->data_ptr() : nullptr,
             topk_idx.data_ptr<topk_idx_t>(),
             next_clean_meta.first,
             next_clean_meta.second,
             num_tokens,
             hidden,
+            num_per_channels,
             num_max_dispatch_tokens_per_rank,
             num_topk,
             num_experts,
